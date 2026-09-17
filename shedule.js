@@ -2,7 +2,7 @@
 // @name         InPlay Schedule Sync
 // @namespace    https://sportarena.win
 // @version      3.0
-// @description  Тихо собирает расписание inplayip.tv за несколько дней и отправляет на сервер. Не мешает работе в учётной записи.
+// @description  Тихо собирает расписание за несколько дней и отправляет на сервер. Не мешает работе в учётной записи.
 // @author       sportarena
 // @match        https://inplayip.tv/*
 // @match        https://www.inplayip.tv/*
