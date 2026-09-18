@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         InPlay Schedule Sync
 // @namespace    https://sportarena.win
-// @version      3.0
+// @version      3.2
 // @description  Тихо собирает расписание за несколько дней и отправляет на сервер. Не мешает работе в учётной записи.
 // @author       sportarena
 // @match        https://inplayip.tv/*
@@ -26,6 +26,8 @@
         HEADERS_URL: 'https://api.inplayip.tv/api/schedule/stream_settings_aliases',
 
         // Приёмник на сервере и его токен (schedule_ingest.php).
+        // Токен уходит ЗАГОЛОВКОМ, а не в строке запроса: строка запроса
+        // целиком попадает в журнал доступа nginx, а оттуда в архивы и копии.
         INGEST_URL:   'https://sportarena.win/schedule_ingest.php',
         INGEST_TOKEN: '18242a65458b18a77998e5f3f6ec2b39',
 
@@ -35,12 +37,16 @@
         DAYS_BACK: 1,
         DAYS_FORWARD: 3,
 
-        // Щадящий режим: случайная пауза между днями, чтобы не слать всё залпом.
-        MIN_GAP_MS: 6000,
-        MAX_GAP_MS: 18000,
+        // Щадящий режим: случайная пауза между днями.
+        // Паузы должны укладываться в цикл повтора с запасом: при пяти днях
+        // пауз четыре, то есть худший проход занимает MAX_GAP_MS * 4 плюс
+        // время самих запросов. При 120 с это около 8 минут против 30 минут
+        // цикла. Поднимая эти числа, сверяйтесь с SYNC_INTERVAL_MIN.
+        MIN_GAP_MS: 45000,
+        MAX_GAP_MS: 120000,
 
         RETRIES: 2,               // повторов на день при сбое
-        INITIAL_DELAY_MS: 8000,   // пауза перед первым сбором после загрузки
+        INITIAL_DELAY_MS: 45000,  // пауза перед первым сбором после загрузки
         SYNC_INTERVAL_MIN: 30,    // как часто повторять полный сбор
         SLIM: false,              // true — только ключевые поля
     };
@@ -106,7 +112,7 @@
 
         const NativeWS = window.WebSocket;
         window.WebSocket = function (url, protocols) {
-            const ws = new NativeWS(url, protocols);
+            const ws = protocols === undefined ? new NativeWS(url) : new NativeWS(url, protocols);
             if (typeof url === 'string' && url.includes('api.inplayip.tv/api-hub')) {
                 const m = url.match(/access_token=([^&]+)/);
                 if (m && m[1]) {
@@ -117,6 +123,12 @@
             return ws;
         };
         window.WebSocket.prototype = NativeWS.prototype;
+        // Статические константы обязательно переносим: без них проверки вида
+        // ws.readyState === WebSocket.OPEN в коде сайта сравниваются с undefined
+        // и всегда ложны — это тихо ломает личный кабинет провайдера.
+        for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+            window.WebSocket[k] = NativeWS[k];
+        }
     })();
 
     // ── Авторизация ─────────────────────────────────────────────────────────────
@@ -131,7 +143,11 @@
             return h;
         }
         if (capturedHeaders && capturedHeaders.Authorization) {
-            return Object.assign(h, capturedHeaders);
+            // Берём только то, что относится к авторизации: остальные
+            // перехваченные заголовки к нашему запросу отношения не имеют.
+            h['Authorization'] = capturedHeaders.Authorization;
+            if (capturedHeaders.DeviceUuid) h['DeviceUuid'] = capturedHeaders.DeviceUuid;
+            return h;
         }
         return null;
     }
@@ -187,17 +203,34 @@
         return Array.isArray(data) ? data : (data && data.events) || [];
     }
 
+    // Возвращает true только при действительно принятой выгрузке.
+    // Раньше эта функция всегда завершалась успехом, и отметка о синхронизации
+    // ставилась даже когда сервер отвечал отказом — сбой оставался незаметным.
     function sendToServer(events, range) {
-        const url = CONFIG.INGEST_URL +
-            (CONFIG.INGEST_URL.includes('?') ? '&' : '?') +
-            'token=' + encodeURIComponent(CONFIG.INGEST_TOKEN);
+        const body = JSON.stringify({ collectedAt: new Date().toISOString(), range, events });
+        log(`Отправляю ${events.length} событий, ${Math.round(body.length / 1024)} КБ`);
+
         return gm({
-            method: 'POST', url, timeout: 60000,
-            headers: { 'Content-Type': 'application/json' },
-            data: JSON.stringify({ collectedAt: new Date().toISOString(), range, events }),
+            method: 'POST', url: CONFIG.INGEST_URL, timeout: 60000,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Ingest-Token': CONFIG.INGEST_TOKEN,
+            },
+            data: body,
         }).then((r) => {
-            if (r.status === 200) log(`Сервер принял выгрузку (${events.length} событий)`);
-            else log(`Сервер вернул HTTP ${r.status}: ${(r.responseText || '').slice(0, 150)}`, true);
+            if (r.status === 200) {
+                log(`Сервер принял выгрузку (${events.length} событий)`);
+                return true;
+            }
+            if (r.status === 413) {
+                log(`Сервер отказал: тело слишком велико (${Math.round(body.length / 1024)} КБ). ` +
+                    'Нужен client_max_body_size на приёмнике.', true);
+            } else if (r.status === 0) {
+                log('Сервер недоступен: соединение не состоялось или истекло время', true);
+            } else {
+                log(`Сервер вернул HTTP ${r.status}: ${(r.responseText || '').slice(0, 150)}`, true);
+            }
+            return false;
         });
     }
 
@@ -236,22 +269,35 @@
                         const key = ev.wtScheduledEventId != null ? ev.wtScheduledEventId
                             : (ev.eventId != null ? ev.eventId
                                 : JSON.stringify([ev.startTime, ev.competitor1, ev.competitor2, ev.channel]));
-                        if (!byKey.has(key)) byKey.set(key, CONFIG.SLIM ? slimEvent(ev) : ev);
+                        // Дни идут от старого к новому, поэтому перезаписываем:
+                        // ближе к эфиру провайдер уточняет данные, и свежая
+                        // версия события важнее той, что была вчера.
+                        byKey.set(key, CONFIG.SLIM ? slimEvent(ev) : ev);
                     }
                     log(`${label}: ${events.length} (уникальных всего: ${byKey.size})`);
                 }
-                if (i < days.length - 1) await sleep(rand(CONFIG.MIN_GAP_MS, CONFIG.MAX_GAP_MS));
+                if (i < days.length - 1) {
+                    const gap = rand(CONFIG.MIN_GAP_MS, CONFIG.MAX_GAP_MS);
+                    log(`пауза ${Math.round(gap / 1000)} с до следующего дня`);
+                    await sleep(gap);
+                }
             }
 
             const all = [...byKey.values()].sort(
                 (a, b) => new Date(a.startTime || 0) - new Date(b.startTime || 0));
 
             if (all.length) {
-                await sendToServer(all, {
+                const ok = await sendToServer(all, {
                     from: days[0].toISOString().slice(0, 10),
                     to: days[days.length - 1].toISOString().slice(0, 10),
                 });
-                GM_setValue('lastSync', { at: Date.now(), count: all.length, errors });
+                // Отметку ставим только при принятой выгрузке, иначе lastSync
+                // показывает благополучие там, где его нет.
+                if (ok) {
+                    GM_setValue('lastSync', { at: Date.now(), count: all.length, errors });
+                } else {
+                    GM_setValue('lastSyncFailed', { at: Date.now(), count: all.length, errors });
+                }
             } else {
                 log('Собрано 0 событий — на сервер не отправляю', true);
             }
@@ -264,6 +310,18 @@
     }
 
     // ── Запуск ────────────────────────────────────────────────────────────────
+    // Предупреждаем, если паузы в худшем случае не укладываются в цикл: тогда
+    // очередной запуск упрётся в защиту от наложения и будет пропущен.
+    (function warnIfTooSlow() {
+        const days = CONFIG.DAYS_BACK + CONFIG.DAYS_FORWARD + 1;
+        const worstMs = CONFIG.INITIAL_DELAY_MS + Math.max(0, days - 1) * CONFIG.MAX_GAP_MS;
+        const cycleMs = Math.max(5, CONFIG.SYNC_INTERVAL_MIN) * 60000;
+        log(`дней в диапазоне: ${days}, худший проход ~${Math.round(worstMs / 60000)} мин при цикле ${Math.round(cycleMs / 60000)} мин`);
+        if (worstMs > cycleMs * 0.7) {
+            log('Паузы великоваты для выбранного цикла — часть запусков будет пропущена', true);
+        }
+    })();
+
     log(`Запущен на ${currentDomain}`);
     setTimeout(collectAndSend, CONFIG.INITIAL_DELAY_MS);
     setInterval(collectAndSend, Math.max(5, CONFIG.SYNC_INTERVAL_MIN) * 60000);
